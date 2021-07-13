@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Feb 17 18:05:21 2021
+Created on Mon Jul 12 09:02:10 2021
 
 @author: nick
 """
@@ -85,6 +85,10 @@ class TransductiveBandit:
         
         # Store z_t here
         self.z = np.zeros((self.nRounds,self.nSteps,2))
+        
+        # Store max objFn over current stage here
+        self.maxObjFn = t.zeros((1,))
+        self.maxGrad = t.zeros((self.n,))
         
         self.sampleComplexity = 0
         
@@ -177,7 +181,7 @@ class TransductiveBandit:
         
         return thetaEstimates
     
-    def updateAllocation(self,allocation,z1,z2):
+    def updateAllocation(self,allocation,z1,z2,takeStep=False):
         
         _arm = t.tensor(self.arms)
         allocation = t.tensor(allocation,requires_grad=True)
@@ -194,24 +198,36 @@ class TransductiveBandit:
         
         objFn = (diff.T @ A_lambda_inv @ diff)
         
-        # Use pytorch autograd to compute gradient of this expression w.r.t the allocation
-        objFn.backward()
+        # Update running max for current stage
+        if objFn > self.maxObjFn:
+            
+            # Use pytorch autograd to compute gradient of this expression w.r.t the allocation
+            objFn.backward()
+            self.maxGrad = allocation.grad
         
-        # Take gradient step
-        # newAllocation = allocation - self.eta * allocation.grad
+        if takeStep:
+            
+            # Take gradient step
+            # newAllocation = allocation - self.eta * allocation.grad
+            
+            # Project back to simplex
+            # newAllocation = newAllocation/t.sum(newAllocation)
+            
+            # Take mirror descent step
+            grad = self.maxGrad
+            expAlloc = allocation * t.exp(-self.eta() * grad)
+            newAllocation = (expAlloc/t.sum(expAlloc)).clone()
+            
+            if t.any(t.isnan(newAllocation)) or t.any(newAllocation<0):
+                print('oops')
+    
+            self.maxObjFn = t.zeros((1,))
+            self.maxGrad = t.zeros((self.n,))
+    
+            return newAllocation.detach().numpy()
         
-        # Project back to simplex
-        # newAllocation = newAllocation/t.sum(newAllocation)
-        
-        # Take mirror descent step
-        grad = allocation.grad
-        expAlloc = allocation * t.exp(-self.eta() * grad)
-        newAllocation = (expAlloc/t.sum(expAlloc)).clone()
-        
-        if t.any(t.isnan(newAllocation)) or t.any(newAllocation<0):
-            print('oops')
-
-        return newAllocation.detach().numpy()
+        else:
+            return allocation.detach().numpy()
     
     def getOptimalAllocationFW(self,z1,z2,initAllocation,epochs=1000):
         '''
@@ -290,7 +306,8 @@ class TransductiveBandit:
         self.numTimesOpt[z1] += 1
         self.numTimesOpt[z2] += 1
 
-        newAllocation = self.updateAllocation(self.allocation[self.k-1,self.t-1],z1,z2)
+        newAllocation = self.updateAllocation(self.allocation[self.k-1,self.t-1],z1,z2,
+                                              takeStep=self.t>=self.nSteps)
         self.allocation[self.k-1,self.t] = newAllocation
 
         self.z[self.k-1,self.t-1,0] = z1
@@ -450,5 +467,5 @@ def runBenchmark():
 
 if __name__=='__main__':
     
-    sampleComplexity,probIncorrect = runBenchmark()
+    scMax,probIncorrect = runBenchmark()
     

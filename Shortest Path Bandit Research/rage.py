@@ -116,31 +116,39 @@ class RageBandit:
         N_alloc = np.ceil((N-.5*p)*alloc)
         diff = np.sum(N_alloc) - N
         
-        while diff > 0:
-            minEntry = np.min((N-1)/alloc)
-            maxEntry = np.max((N_alloc-1)/alloc)
+        while np.sum(N_alloc) - N != 0:
+            # minEntry = np.min(N_alloc/alloc)
+            # maxEntry = np.max((N_alloc-1)/alloc)
             
-            minMask = N_alloc/alloc==minEntry
-            maxMask = (N_alloc-1)/alloc==maxEntry
+            # minMask = N_alloc/alloc==minEntry
+            # maxMask = (N_alloc-1)/alloc==maxEntry
             
-            if np.sum(minMask)>0:
-                j = np.where(minMask)[0][0]
-                N_alloc[j] = N_alloc[j] + 1
+            # if np.sum(minMask)>0:
+            #     j = np.where(minMask)[0][0]
+            #     N_alloc[j] = N_alloc[j] + 1
                 
-            elif np.sum(maxMask)>0:
-                k = np.where(maxMask)[0][0]
-                N_alloc[k] = N_alloc[k] - 1
-        
-            # print('iteration {}; diff={}'.format(l,diff))
-            l += 1
-            diff = np.sum(N_alloc) - N
+            # elif np.sum(maxMask)>0:
+            #     k = np.where(maxMask)[0][0]
+            #     N_alloc[k] = N_alloc[k] - 1
             
+            # We might divide by zero here
+            with np.errstate(divide='ignore'):
+                j = np.argmin(np.nan_to_num(N_alloc/alloc,nan=np.inf))
+                k = np.argmax(np.nan_to_num((N_alloc-1)/alloc,nan=0))
+
+            if diff<0:
+                N_alloc[j] = N_alloc[j] + 1
+            else:
+                N_alloc[k] = N_alloc[k] - 1
         
         return N_alloc.astype(int)
     
     def getY(self,Z):
         Y = (Z[:,None,:]-Z[None,:,:]).reshape((Z.shape[0]**2,self.d))
         Y = Y[np.abs(Y).sum(axis=1) != 0]
+        
+        # Only want to include differences between arms once each
+        Y = np.unique(Y,axis=0)
         return Y
     
     def playStep(self,r_eps=None):
@@ -161,7 +169,8 @@ class RageBandit:
 
         """
         if r_eps is None:
-            r_eps=(self.d*(self.d+1)/2 +1)/self.epsilon
+            # r_eps=(self.d*(self.d+1)/2 +1)/self.epsilon
+            r_eps=self.d**2/self.epsilon
         
         delta_t = self.delta/self.t**2
         Z_t = self.Z_t[self.t-1]
@@ -170,8 +179,9 @@ class RageBandit:
         lambda_t,rho_t = self.getOptimalAllocationFW(Z_t, self.initAlloc)
         
         # Compute the total number of samples to take for this round
-        N_t = np.maximum(np.ceil(8*(2**(self.t+2))**2 * rho_t *\
-                                 (1+self.epsilon) * np.log(Z_t.shape[0]**2 / delta_t)),r_eps)
+        N_t = np.maximum(np.ceil(8*(2**(self.t+1))**2 * rho_t *\
+                                 (1+self.epsilon) * np.log(self.Z.shape[0]**2 / delta_t)),
+                                 r_eps)
             
         self.sampleComplexity += N_t
         
@@ -197,7 +207,7 @@ class RageBandit:
         
         # Increment the step
         self.t += 1
-        print('Done with round {}'.format(self.t))
+        print('Done with round {}'.format(self.t-1))
         
     def play(self):
         """
@@ -293,14 +303,16 @@ class RageBandit:
         
 def runBenchmark():
 
-    np.random.seed(12345)
+    np.random.seed(123456)
     
     nReps = 20
     dVals = (5,10,15,20,25,30,35)
+    # dVals = (35,)
     
     sampleComplexity = []
+    incorrectCount = np.zeros((len(dVals,)))
     
-    for d in dVals:
+    for i,d in enumerate(dVals):
         
         print('d={}'.format(d))
         
@@ -318,9 +330,17 @@ def runBenchmark():
             
             print('Replication {} of {}'.format(rep,nReps))
             
-            bandit = RageBandit(X,Z,delta=.05,epsilon=.2,theta=theta)
+            bandit = RageBandit(X,Z,delta=.05,epsilon=.2,theta=theta,initAlloc=initAlloc)
             bandit.play() 
             results.append(bandit.sampleComplexity)
+            
+            # Check that the result is correct
+            try:
+                assert(np.all(bandit.Z_t[-1]==X[0]))
+            except:
+                print('Claimed best arm: {}'.format(bandit.Z_t[-1]))
+                print('Best arm: {}'.format(X[0]))
+                incorrectCount[i] += 1
             
         sampleComplexity.append(sum(results)/nReps)
         
@@ -332,6 +352,10 @@ def runBenchmark():
     ax.set_ylim([10**2,10**8])
     ax.set_yticks([10**k for k in range(2,9)])
     
+    probIncorrect = incorrectCount/nReps
+    
+    return sampleComplexity,probIncorrect
+    
 def runTransductiveExample():
     
     np.random.seed(12345)
@@ -339,8 +363,8 @@ def runTransductiveExample():
     nReps = 20
     dVals = (20,40,60,80)
     
-    # nReps = 1
-    # dVals = (20,)
+    # nReps = 100
+    # dVals = (4,)
     
     sampleComplexity = []
     
@@ -390,9 +414,10 @@ def runTransductiveExample():
     
     probIncorrect = incorrectCount/(nReps*len(dVals))
     
-    return bandit,probIncorrect
+    return sampleComplexity,probIncorrect
 
 if __name__=='__main__':
     
-    bandit,probIncorrect = runTransductiveExample()
+    # bandit,probIncorrect = runTransductiveExample()
+    sc,probIncorrect = runBenchmark()
     
