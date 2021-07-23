@@ -5,7 +5,7 @@ Created on Wed Feb 17 18:05:21 2021
 
 @author: nick
 """
-
+import sys
 import numpy as np
 import torch as t
 from scipy.optimize import linprog
@@ -91,8 +91,9 @@ class TransductiveBandit:
         self.armsHistory = []
         self.rewardsHistory = []
         self.B_t = np.eye(self.d)
+        self.rewTimesArms = np.zeros((self.d,))
         
-        self.optZ = None
+        self.zHat = None
         
     def eta(self):
         return self._eta / self.t**2
@@ -154,9 +155,10 @@ class TransductiveBandit:
         """
         
         Binv = np.linalg.pinv(self.B_t)
-        thetaHat = Binv @ np.sum(np.concatenate(self.armsHistory) *\
-                                 np.concatenate(self.rewardsHistory)[:,None],
-                                 axis=0)
+        # thetaHat = Binv @ np.sum(np.concatenate(self.armsHistory) *\
+        #                          np.concatenate(self.rewardsHistory)[:,None],
+        #                          axis=0)
+        thetaHat = Binv @ self.rewTimesArms
         
         return thetaHat,Binv
     
@@ -304,15 +306,17 @@ class TransductiveBandit:
             
             # Draw arms from current allocation and pull
             arms = self.drawArms(self.allocation[self.k-1,self.t-1])
-            _arms = self.arms[arms]
             rewards = self.pull(arms)
             
             # Track history
-            self.armsHistory.append(_arms)
-            self.rewardsHistory.append(rewards)
+            # self.armsHistory.append(_arms)
+            # self.rewardsHistory.append(rewards)
             
             # Update B matrix
-            self.B_t += np.sum(_arms[:,None,:] * _arms[:,:,None],axis=0)
+            self.updateB_t(arms)
+            
+            # Update rewards times arms
+            self.rewTimesArms += np.sum(self.arms[arms] * rewards[:,None],axis=0)
             
             # Update sample complexity
             self.sampleComplexity += arms.shape[0]
@@ -329,18 +333,54 @@ class TransductiveBandit:
             
             self.allocation[self.k,0] = newAllocation
             
+            # Check if termination condition is met
+            terminateNow,zHat = self.checkTerminationCond()
+            
             print('Done with round {}'.format(self.k))
             
             self.k += 1
             self.t = 1
             
-            empiricalProbOpt = self.numTimesOpt/np.sum(self.numTimesOpt)
-            # print(empiricalProbOpt)
-            if np.max(empiricalProbOpt) >= 1-self.delta:
-                self.optZ = np.argmax(empiricalProbOpt)
+            # empiricalProbOpt = self.numTimesOpt/np.sum(self.numTimesOpt)
+            # # print(empiricalProbOpt)
+            # if np.max(empiricalProbOpt) >= 1-self.delta:
+            #     self.optZ = np.argmax(empiricalProbOpt)
                 
             self.numTimesOpt = np.zeros((self.Z.shape[0],))
+            
+            if terminateNow:
+                return zHat
+            else:
+                return None
         
+    def updateB_t(self,arms):
+        
+        playsPerArm = np.bincount(arms,minlength=self.n)
+        
+        self.B_t += np.sum(playsPerArm[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0)
+        
+    def checkTerminationCond(self):
+        
+        zHat = np.argmax(np.sum(self.Z * self.posteriorMean[self.k],axis=1))
+        diff = self.Z[zHat][None,:] - self.Z
+        diff = diff[np.sum(np.abs(diff),axis=1)>0]
+        
+        allocation = self.allocation[self.k,0]
+        A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(allocation[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        # A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
+        
+        # A_inv = np.linalg.pinv(self.B_t)
+        A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
+        
+        rhs = np.sqrt(2*A_inv_norm*np.log(2*self.Z.shape[0]*self.k**2/self.delta))
+        # rhs = np.sqrt(2*A_inv_norm*np.log(self.Z.shape[0]*2/self.delta))
+        lhs = np.sum(diff * self.posteriorMean[self.k],axis=1)
+        
+        # print(lhs - rhs)
+        terminateNow = np.all(lhs >= rhs)
+        
+        return terminateNow,zHat
+    
     def play(self):
         """
         Play the bandit using LinUCB algorithm
@@ -351,11 +391,12 @@ class TransductiveBandit:
 
         """
         
-        while self.k <= self.nRounds:
+        while True:
             
-            self.playStep()
+            zHat = self.playStep()
             
-            if self.optZ is not None:
+            if zHat is not None:
+                self.zHat = zHat
                 break      
 
 def getOptimalAllocation(X,Z,theta,initAllocation,eta=1e-3,epochs=5000):
@@ -396,7 +437,9 @@ def runBenchmark():
     np.random.seed(123456)
     
     nReps = 20
-    dVals = (5,10,15,20,25,30,35)
+    dVals = (5,10,15,20,25,30)
+    # dVals = (5,10,15,20,25,30,35)
+    # dVals = (35,)
     
     sampleComplexity = []
     incorrectCount = np.zeros((len(dVals,)))
@@ -412,7 +455,7 @@ def runBenchmark():
         theta = 2*Z[0]
         
         T = 1000
-        K = 10
+        K = 50
         
         # Index of the optimal choice in Z
         initAlloc = np.ones((n,))/n
@@ -422,15 +465,15 @@ def runBenchmark():
             
             print('Replication {} of {}'.format(rep,nReps))
             
-            bandit = TransductiveBandit(X,Z,initAlloc,T,K,lambd_reg=0,theta=theta)
+            bandit = TransductiveBandit(X,X,initAlloc,T,K,lambd_reg=0,theta=theta)
             bandit.play() 
             results.append(bandit.sampleComplexity)
             
             # Check that the result is correct
             try:
-                assert(np.all(bandit.arms[bandit.optZ]==X[0]))
+                assert(np.all(bandit.arms[bandit.zHat]==X[0]))
             except:
-                print('Claimed best arm: {}'.format(bandit.optZ))
+                print('Claimed best arm: {}'.format(bandit.zHat))
                 print('Best arm: {}'.format(X[0]))
                 incorrectCount[i] += 1
             
@@ -450,5 +493,5 @@ def runBenchmark():
 
 if __name__=='__main__':
     
-    sampleComplexity,probIncorrect = runBenchmark()
+    scBayes,probIncorrect = runBenchmark()
     

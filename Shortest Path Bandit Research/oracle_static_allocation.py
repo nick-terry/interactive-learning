@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Fri Jul  2 10:32:36 2021
+Created on Wed Feb 17 18:05:21 2021
 
 @author: nick
 """
@@ -11,12 +11,12 @@ import torch as t
 from scipy.optimize import linprog
 import matplotlib.pyplot as plt
 
-class RageBandit:
+class OracleAllocation:
     
-    def __init__(self,arms,Z,delta,epsilon,theta,initAlloc,lambd_reg=0,eta=1e-5,sigma=1):
+    def __init__(self,arms,Z,initAlloc,theta,delta=.05,eta=1e-5,sigma=1):
         """
-        Implementation of Rage Algorithm
-        https://arxiv.org/abs/1906.08399
+        Implementation of a linear transductive bandit algorithm based on iteratively 
+        refining a deterministic sampling allocation
 
         Parameters
         ----------
@@ -26,10 +26,14 @@ class RageBandit:
             Choices (vectors) from which we are trying to maximize z^T \theta
         initAlloc : np array
             Initial allocation over the arms
+        horizon : TYPE
+            DESCRIPTION.
         lambd_reg : TYPE
             DESCRIPTION.
         theta : TYPE
             DESCRIPTION.
+        N : int
+            Number of samples to draw from allocation at each stage.
         eta : float
             Step size for optimizing allocation
         sigma : float, optional
@@ -43,31 +47,30 @@ class RageBandit:
         
         self.arms = arms
         self.Z = Z
-        self.Z_t = [Z,]
-        self.delta = delta
-        self.epsilon = epsilon
-        
-        self.initAlloc = initAlloc
-        
-        self.lambd_reg = lambd_reg
         
         # True theta used to generate rewards
         self.theta = theta
         self.zStar = np.argmax(theta)
-        self.eta = eta
+        self._eta = eta
         self.sigma = sigma
+        self.delta = delta
+        
+        self.initAlloc = initAlloc
         
         # Dimension of the action space
         self.d = self.arms.shape[1]
         # Number of possible actions (arms)
         self.n = self.arms.shape[0]
         
-        # Current round
-        self.t = 1
-        
-        self.history = []
+        self.A = np.eye(self.d)
+        self.Ainv = np.eye(self.d)
+        self.b = np.zeros((self.d,))
         
         self.sampleComplexity = 0
+        
+        self.zHat = None
+        
+        self.t = 1
         
     def pull(self,arms):
         """
@@ -108,148 +111,145 @@ class RageBandit:
         
         return thetaHat
     
-    def fastRound(self,alloc,N):
-        
-        l = 1
-        
-        p = alloc.shape[0]
-        N_alloc = np.ceil((N-.5*p)*alloc).astype(int)
-        diff = np.sum(N_alloc) - N
-        
-        while diff != 0:
-            
-            # We might divide by zero here
-            with np.errstate(divide='ignore'):
-                j = np.argmin(np.nan_to_num(N_alloc/alloc,nan=np.inf))
-                k = np.argmax(np.nan_to_num((N_alloc-1)/alloc,nan=0))
-
-            if diff<0:
-                N_alloc[j] = N_alloc[j] + 1
-            else:
-                N_alloc[k] = N_alloc[k] - 1
-            
-            diff = np.sum(N_alloc) - N
-        
-        return N_alloc
-    
-    def getY(self,Z):
-        Y = (Z[:,None,:]-Z[None,:,:]).reshape((Z.shape[0]**2,self.d))
+    def getY(self,X):
+        Y = (X[:,None,:]-X[None,:,:]).reshape((X.shape[0]**2,self.d))
         Y = Y[np.abs(Y).sum(axis=1) != 0]
         
         # Only want to include differences between arms once each
         Y = np.unique(Y,axis=0)
         return Y
     
-    def playStep(self,r_eps=None):
-        """
-        Update the state of the bandit after a step.
-
-        Parameters
-        ----------
-        arm : int
-            Index of the arm that was played.
-        outcome : float
-            The random reward which was observed.
-
-
-        Returns
-        -------
-        None.
-
-        """
-        if r_eps is None:
-            r_eps=(self.d*(self.d+1)/2 +1)/self.epsilon
-            # r_eps = int(np.ceil(180*self.d/self.epsilon**2))
+    def drawArms(self,allocation):
         
-        delta_t = self.delta/self.t**2
-        Z_t = self.Z_t[self.t-1]
-        
-        # Get the optimal sampling allocation
-        lambda_t,rho_t = self.getOptimalAllocationFW(Z_t, self.initAlloc)
-        
-        # Compute the total number of samples to take for this round
-        N_t = int(np.maximum(np.ceil(8*(2**(self.t+1))**2 * rho_t *\
-                                 (1+self.epsilon) * np.log(self.Z.shape[0]**2 / delta_t)),
-                                 r_eps))
-            
-        self.sampleComplexity += N_t
-        
-        # Round the allocation to get the number of times to pull each arm
-        nPullsPerArm = self.fastRound(lambda_t,N_t)
-        arms = np.concatenate([np.tile(i,(nPullsPerArm[i],1)) for i in range(self.n)]).squeeze()
+        sampledArms = np.random.choice(np.arange(self.n),2**(self.t+1),p=allocation)
+        return sampledArms
     
+    def playStep(self):
+        
+        X = self.arms
+        
+        # # Choose next arm to greedily add
+        # _Ainv = Ainv[None,:,:] - (Ainv[None,:,:] @ (X[:,None,:] * X[:,:,None]) @ Ainv[None,:,:])/\
+        #         (1+X[:,None,:] * Ainv *  X[:,:,None])
+            
+        # objFn =  np.sum(np.sum(Y[:,None,None,:] * _Ainv[None,:,:,:],axis=2) *\
+        #                 Y[:,None,:],axis=2)
+        # optArmToAdd = np.argmin(np.max(objFn,axis=0))
+        
+        # Draw arms to pull from sampling allocation
+        arms = self.drawArms(self.alloc)
+        
         # Pull arms
         rewards = self.pull(arms)
         
+        # Update some stored values
+        self.updateA(arms)
+        self.Ainv = np.linalg.pinv(self.A)
+        self.b += np.sum(self.arms[arms] * rewards[:,None],axis=0)
+        
+        self.sampleComplexity += arms.shape[0]
+        
         # Get (regularized) least squares estimator of theta
-        thetaHat = self.estimate(arms, rewards)
+        self.thetaHat = self.Ainv @ self.b
         
-        # Figure out which arms are eliminated
-        armsToRemove = set()
-        for arm in Z_t:
-            innerProd = np.sum((Z_t - arm[None,:]) * thetaHat,axis=1)
-            if np.any(innerProd >= 2** -(self.t+2)):
-                armsToRemove.add( tuple(arm) )
+        # Get our guess of the best arm
+        self.zHat = np.argmax(np.sum(self.Z * self.thetaHat,axis=1)).astype(int)
         
-        _Z_t = set([tuple(arm) for arm in Z_t]) - armsToRemove
-        self.Z_t.append(np.array([np.array(item) for item in _Z_t]))
-        
-        # Increment the step
         self.t += 1
-        print('Done with round {}'.format(self.t-1))
+        if self.t %10000 ==0:
+            print('Done with round {}'.format(self.t))
+    
+    def updateA(self,arms):
         
+        playsPerArm = np.bincount(arms,minlength=self.n)
+        
+        self.A += np.sum(playsPerArm[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0)
+    
+    def checkTerminatingCond(self):
+         
+        zHat = self.arms[self.zHat]
+        diff = zHat[None,:] - self.Z
+        diff = diff[np.sum(np.abs(diff),axis=1)>0]
+        
+        A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(self.alloc[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
+       
+        # rhs = 2*np.sqrt(2*A_inv_norm*np.log(self.arms.shape[0]**2/self.delta)/np.log(self.t))
+        
+        # Use rhs from RAGE
+        rhs = np.sqrt(2*A_inv_norm*np.log(2*self.arms.shape[0] * self.t**2/self.delta))
+        lhs = np.sum(diff * self.thetaHat,axis=1)
+        # print(lhs-rhs)
+        terminateNow = np.all(lhs >= rhs)
+        
+        return terminateNow
+    
     def play(self):
         """
-        Play the bandit using LinUCB algorithm
+        Play the bandit using the optimal static allocation
 
         Returns
         -------
         None.
 
         """
+        terminate = False
         
-        while self.Z_t[self.t-1].shape[0] > 1:
+        self.alloc,_ = self.getOracleAllocationFW()
+        
+        while not terminate:
             
             self.playStep()
-        
-
-    def getOptimalAllocation(self,Z_t,initAllocation,epochs=2500,eta=1e-3):
+            terminate = self.checkTerminatingCond()
+    
+    def getOptimalAllocation(self,eta=1e-3,epochs=5000):
         '''
         Use the distribution of \theta_* to compute the optimal sampling allocation using mirror descent.
         '''
-        arms = t.tensor(self.arms)
-        Z = t.tensor(Z_t)
+        X,Z,theta,initAllocation = self.arms,self.Z,self.theta,self.initAlloc
         
-        Y = t.tensor(self.getY(Z_t))
+        arms = t.tensor(X)
+        Z = t.tensor(Z)
+        zStar_i = t.argmax(t.sum(Z*theta,dim=-1))
+        _Z = arms[t.tensor([z for z in range(Z.shape[0]) if z!=zStar_i])]
+        zStar = arms[t.argmax(t.sum(Z*theta,dim=-1))]
         
         allocation = t.tensor(initAllocation,requires_grad=True)
         
+        print('Solving for optimal sampling allocation...')
         for epoch in range(epochs):
             
             # Compute objective function
             A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (arms[:,None,:] * arms[:,:,None]),axis=0))
-
-            rho = t.max((Y @ A_lambda_inv @ Y.T)[0])
+            diff = zStar - _Z
+            objFn = t.max((diff @ A_lambda_inv @ diff.T)[0]/(diff @ theta)**2)
             
             # Compute gradient
-            rho.backward()
+            objFn.backward()
             grad = allocation.grad
             
             # Update using closed-form mirror descent update for KL divergence
             expAlloc = allocation * t.exp(-eta * grad)
             allocation = (expAlloc/t.sum(expAlloc)).clone().detach().requires_grad_(True)
-
             
-        return allocation.detach().numpy(),rho.detach().numpy()
+            # if epoch%1000==0:
+            #     print('Done with epoch {}!'.format(epoch))
+        
+        phi = objFn.detach().numpy()
+            
+        return allocation.detach().numpy(),phi
     
-    def getOptimalAllocationFW(self,Z_t,initAllocation,epochs=1000):
+    def getOracleAllocationFW(self,eta=1e-3,epochs=5000):
         '''
         Use the distribution of \theta_* to compute the optimal sampling allocation using Frank-Wolfe.
         '''
-        arms = t.tensor(self.arms)
-        Z = t.tensor(Z_t)
+        X,Z,theta,initAllocation = self.arms,self.Z,self.theta,self.initAlloc
         
-        Y = t.tensor(self.getY(Z_t))
+        arms = t.tensor(X)
+        Z = t.tensor(Z)
+        zStar_i = t.argmax(t.sum(Z*theta,dim=-1))
+        _Z = arms[t.tensor([z for z in range(Z.shape[0]) if z!=zStar_i])]
+        zStar = arms[t.argmax(t.sum(Z*theta,dim=-1))]
         
         allocation = t.tensor(initAllocation,requires_grad=True)
         
@@ -261,14 +261,14 @@ class RageBandit:
         b_eq = 1
         
         for epoch in range(epochs):
-            
+
             # Compute objective function
             A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (arms[:,None,:] * arms[:,:,None]),axis=0))
-
-            rho = t.max((Y @ A_lambda_inv @ Y.T)[0])
+            diff = zStar - _Z
+            objFn = t.max((diff @ A_lambda_inv @ diff.T)[0]/(diff @ theta)**2)
             
             # Compute gradient
-            rho.backward()
+            objFn.backward()
             grad = allocation.grad
             
             # Update using Frank-Wolfe step
@@ -288,15 +288,14 @@ class RageBandit:
             allocation[toZeroMask] = 0
             allocation = allocation/t.sum(allocation)
         
-        return allocation.detach().numpy(),rho.detach().numpy()
-        
+        return allocation.detach().numpy(),objFn.detach().numpy()
+
 def runBenchmark():
 
     np.random.seed(123456)
     
     nReps = 20
     dVals = (5,10,15,20,25,30,35)
-    # dVals = (35,)
     
     sampleComplexity = []
     incorrectCount = np.zeros((len(dVals,)))
@@ -311,6 +310,9 @@ def runBenchmark():
         n = X.shape[0]
         theta = 2*Z[0]
         
+        T = 1000
+        K = 20
+        
         # Index of the optimal choice in Z
         initAlloc = np.ones((n,))/n
         
@@ -319,15 +321,15 @@ def runBenchmark():
             
             print('Replication {} of {}'.format(rep,nReps))
             
-            bandit = RageBandit(X,X,delta=.05,epsilon=.2,theta=theta,initAlloc=initAlloc)
+            bandit = OracleAllocation(X,X,initAlloc,theta=theta)
             bandit.play() 
             results.append(bandit.sampleComplexity)
             
             # Check that the result is correct
             try:
-                assert(np.all(bandit.Z_t[-1]==X[0]))
+                assert(np.all(bandit.arms[bandit.zHat]==X[0]))
             except:
-                print('Claimed best arm: {}'.format(bandit.Z_t[-1]))
+                print('Claimed best arm: {}'.format(bandit.zHat))
                 print('Best arm: {}'.format(X[0]))
                 incorrectCount[i] += 1
             
@@ -344,69 +346,8 @@ def runBenchmark():
     probIncorrect = incorrectCount/nReps
     
     return sampleComplexity,probIncorrect
-    
-def runTransductiveExample():
-    
-    np.random.seed(12345)
-    
-    nReps = 20
-    dVals = (20,40,60,80)
-    
-    # nReps = 100
-    # dVals = (4,)
-    
-    sampleComplexity = []
-    
-    incorrectCount = 0
-    
-    for d in dVals:
-        
-        print('d={}'.format(d))
-        
-        X = np.eye(d)
-        Z = np.concatenate([np.eye(d)[:d//2],] +\
-                           [(np.cos(.1)*X[j] + np.sin(.1)*X[j+d//2])[None,:] for j in range(0,d//2)])
-
-        n = X.shape[0]
-        theta = X[0]
-        
-        # Index of the optimal choice in Z
-        initAlloc = np.ones((n,))/n
-        
-        results = []
-        for rep in range(nReps):
-            
-            print('Replication {} of {}'.format(rep,nReps))
-            
-            bandit = RageBandit(X,Z,delta=.05,epsilon=.2,theta=theta,initAlloc=initAlloc)
-            bandit.play()
-            
-            # Check that the result is correct
-            try:
-                assert(np.all(bandit.Z_t[-1]==X[0]))
-            except:
-                print('Claimed best arm: {}'.format(bandit.Z_t[-1]))
-                print('Best arm: {}'.format(X[0]))
-                incorrectCount += 1
-                
-            results.append(bandit.sampleComplexity)
-            
-        sampleComplexity.append(sum(results)/nReps)
-        
-    fig,ax = plt.subplots(1)
-    ax.plot(dVals,sampleComplexity)
-    ax.set_xlabel('d')
-    ax.set_ylabel('Sample Complexity')
-    ax.set_yscale('log')
-    ax.set_ylim([10**2,10**8])
-    ax.set_yticks([10**k for k in range(2,9)])
-    
-    probIncorrect = incorrectCount/(nReps*len(dVals))
-    
-    return sampleComplexity,probIncorrect
 
 if __name__=='__main__':
     
-    # bandit,probIncorrect = runTransductiveExample()
-    scRage,probIncorrect = runBenchmark()
+    scOracle,probIncorrect = runBenchmark()
     

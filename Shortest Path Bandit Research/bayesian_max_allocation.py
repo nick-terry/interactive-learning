@@ -127,24 +127,6 @@ class TransductiveBandit:
         
         return outcome
     
-    # def estimate(self,arms,rewards):
-    #     """
-    #     Compute the regularized least squares estimator for theta. This should
-    #     happen when self.t is up-to-date.
-
-    #     Returns
-    #     -------
-    #     thetaHat : float
-    #         The regularized least squares  estimator of theta
-
-    #     """
-        
-    #     _arms = self.arms[arms]
-    #     Ainv = np.linalg.pinv(np.sum(_arms[:,None,:] * _arms[:,:,None],axis=0))
-    #     thetaHat = Ainv @ np.sum(_arms * rewards[:,None],axis=0)
-        
-    #     return thetaHat
-    
     def getPosterior(self):
         """
         Compute the regularized least squares estimator for theta. This should
@@ -163,24 +145,7 @@ class TransductiveBandit:
                                  axis=0)
         
         return thetaHat,Binv
-    
-    def getBootstrapEstimates(self,arms,rewards):
-        
-        # Randomly choose the indices of observations we will use
-        bootstrapIdx = np.array([np.random.choice(range(arms.shape[0]), arms.shape[0], replace = True) for _ in range(arms.shape[0])])
-        
-        thetaEstimates = np.zeros((arms.shape[0],self.d))
-        
-        # Get the corresponding arms and rewards
-        for i in range(arms.shape[0]):
-            
-            bootstrapArms = arms[bootstrapIdx[i]]
-            bootstrapRewards = rewards[bootstrapIdx[i]]
-            
-            thetaEstimates[i] = self.estimate(bootstrapArms, bootstrapRewards)
-        
-        return thetaEstimates
-    
+
     def updateAllocation(self,allocation,z1,z2,takeStep=False):
         
         _arm = t.tensor(self.arms)
