@@ -49,7 +49,7 @@ def runReplicates(algList,dVals):
             nReplications = 2
             with mp.Pool(nReplications) as _pool:
                 result = _pool.map_async(runReplicate,
-                                          [(alg,args)]*nReplications,
+                                          (alg,args),
                                           callback=lambda x : print('Done!'))
                 result.wait()
                 resultList = result.get()
