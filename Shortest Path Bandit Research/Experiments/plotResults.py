@@ -9,7 +9,7 @@ Created on Wed Jul 21 11:06:20 2021
 import matplotlib.pyplot as plt
 import csv
 
-with open('benchmarkResults.csv','r') as f:
+with open('benchmarkResults_50rep.csv','r') as f:
     reader = csv.reader(f)\
     
     i = 1

@@ -14,6 +14,7 @@ import rage
 import xy_static_allocation
 import oracle_static_allocation
 import bayesian_iterative_allocation
+import bayesian_allocation
 
 def runReplicates(algList,dVals):
     
@@ -36,20 +37,20 @@ def runReplicates(algList,dVals):
             initAlloc = np.ones((n,))/n
         
             # Static XY
-            if i == 1:
+            if i == 0:
                 args = (X,Z,initAlloc,theta)
-            elif i == 2:
+            elif i == 1:
                 args = (X,Z,.05,.2,theta,initAlloc)
-            elif i == 3:
+            elif i == 2:
                 args = (X,Z,initAlloc,T,K,0,theta)
             else:
                 args = (X,Z,initAlloc,theta)
 
             # Run the replications in parallel
-            nReplications = 2
+            nReplications = 20
             with mp.Pool(nReplications) as _pool:
                 result = _pool.map_async(runReplicate,
-                                          (alg,args),
+                                          [(alg,args)]*nReplications,
                                           callback=lambda x : print('Done!'))
                 result.wait()
                 resultList = result.get()
@@ -77,13 +78,11 @@ if __name__ == '__main__':
     seed = 123456
     np.random.seed(seed)
     
-    # algList = (xy_static_allocation.StaticAllocation,
-    #            rage.RageBandit,
-    #            bayesian_iterative_allocation.TransductiveBandit,
-    #            oracle_static_allocation.OracleAllocation)
-    # dVals = (5,10,15,20,25,30,35)
-    algList = (rage.RageBandit,)
-    dVals = (5,)
+    algList = (xy_static_allocation.StaticAllocation,
+                rage.RageBandit,
+                bayesian_allocation.TransductiveBandit,
+                oracle_static_allocation.OracleAllocation)
+    dVals = (5,10,15,20,25,30,35)
     scResults = runReplicates(algList, dVals)
     
     # Save the results to csv

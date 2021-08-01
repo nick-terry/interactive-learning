@@ -171,7 +171,9 @@ class OracleAllocation:
         diff = zHat[None,:] - self.Z
         diff = diff[np.sum(np.abs(diff),axis=1)>0]
         
-        A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(self.alloc[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        # A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(self.alloc[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        
+        A_lambda_inv = np.linalg.pinv(self.A)
         A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
        
         # rhs = 2*np.sqrt(2*A_inv_norm*np.log(self.arms.shape[0]**2/self.delta)/np.log(self.t))
@@ -245,11 +247,11 @@ class OracleAllocation:
         '''
         X,Z,theta,initAllocation = self.arms,self.Z,self.theta,self.initAlloc
         
-        arms = t.tensor(X)
+        X = t.tensor(X)
         Z = t.tensor(Z)
         zStar_i = t.argmax(t.sum(Z*theta,dim=-1))
-        _Z = arms[t.tensor([z for z in range(Z.shape[0]) if z!=zStar_i])]
-        zStar = arms[t.argmax(t.sum(Z*theta,dim=-1))]
+        _Z = X[t.tensor([z for z in range(Z.shape[0]) if z!=zStar_i])]
+        zStar = X[t.argmax(t.sum(Z*theta,dim=-1))]
         
         allocation = t.tensor(initAllocation,requires_grad=True)
         
@@ -263,13 +265,17 @@ class OracleAllocation:
         for epoch in range(epochs):
 
             # Compute objective function
-            A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (arms[:,None,:] * arms[:,:,None]),axis=0))
+            A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (X[:,None,:] * X[:,:,None]),axis=0))
             diff = zStar - _Z
-            objFn = t.max((diff @ A_lambda_inv @ diff.T)[0]/(diff @ theta)**2)
+            
+            rho = (diff @ A_lambda_inv @ diff.T)[0]/(diff @ theta)**2
+            objFn = t.max(rho)
+            yMax = t.argmax(rho)
             
             # Compute gradient
-            objFn.backward()
-            grad = allocation.grad
+            # objFn.backward()
+            # grad = allocation.grad
+            grad = (-diff[yMax] @ A_lambda_inv @ (X[:,None,:] * X[:,:,None]) @ A_lambda_inv @ diff[yMax]).detach()
             
             # Update using Frank-Wolfe step
             aMin = t.tensor(linprog(grad.numpy(),A_ub,b_ub,A_eq,b_eq).x)
@@ -295,7 +301,8 @@ def runBenchmark():
     np.random.seed(123456)
     
     nReps = 20
-    dVals = (5,10,15,20,25,30,35)
+    # dVals = (5,10,15,20,25,30,35)
+    dVals = (5,)
     
     sampleComplexity = []
     incorrectCount = np.zeros((len(dVals,)))

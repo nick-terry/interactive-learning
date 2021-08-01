@@ -169,7 +169,8 @@ class StaticAllocation:
         diff = zHat[None,:] - self.Z
         diff = diff[np.sum(np.abs(diff),axis=1)>0]
         
-        A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(self.alloc[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        # A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(self.alloc[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        A_lambda_inv = self.Ainv
         
         # A_inv_norm = np.sum((diff @ self.Ainv[None,:,:]).squeeze() * diff,axis=1)
         A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
@@ -177,7 +178,7 @@ class StaticAllocation:
         # rhs = 2*np.sqrt(2*A_inv_norm*np.log(self.arms.shape[0]**2/self.delta)/np.log(self.t))
         
         # Use rhs from RAGE
-        rhs = np.sqrt(2*A_inv_norm*np.log(2*self.arms.shape[0] * self.t**2/self.delta))
+        rhs = np.sqrt(2*A_inv_norm*np.log(2*self.Z.shape[0] * self.t**2/self.delta))
         lhs = np.sum(diff * self.thetaHat,axis=1)
         # print(lhs-rhs)
         terminateNow = np.all(lhs >= rhs)
@@ -247,8 +248,6 @@ class StaticAllocation:
         
         allocation = t.tensor(initAllocation,requires_grad=True)
         
-        allocation = t.tensor(initAllocation,requires_grad=True)
-        
         # Define some stuff for minimizing inner product over simplex
         A_ub = -np.eye(self.n)
         b_ub = np.zeros((self.n,1))
@@ -260,12 +259,17 @@ class StaticAllocation:
 
             # Compute objective function
             A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (X[:,None,:] * X[:,:,None]),axis=0))
+            # A_lambda_inv = self.Ainv
+            
             diff = (X[None,:,:] - X[:,None,:]).reshape(X.shape[0]**2,X.shape[1])
-            objFn = t.max(t.sum((diff @ A_lambda_inv).squeeze() * diff,dim=1)).squeeze()
+            rho = t.sum((diff @ A_lambda_inv).squeeze() * diff,dim=1)
+            objFn = t.max(rho).squeeze()
+            yMax = t.argmax(rho).squeeze()
             
             # Compute gradient
-            objFn.backward()
-            grad = allocation.grad
+            # objFn.backward()
+            # grad = allocation.grad
+            grad = (-diff[yMax] @ A_lambda_inv @ (X[:,None,:] * X[:,:,None]) @ A_lambda_inv @ diff[yMax]).detach()
             
             # Update using Frank-Wolfe step
             aMin = t.tensor(linprog(grad.numpy(),A_ub,b_ub,A_eq,b_eq).x)
@@ -294,7 +298,7 @@ def runBenchmark():
     
     nReps = 20
     # dVals = (5,10,15,20,25,30,35)
-    dVals = (30,)
+    dVals = (5,)
     
     sampleComplexity = []
     incorrectCount = np.zeros((len(dVals,)))

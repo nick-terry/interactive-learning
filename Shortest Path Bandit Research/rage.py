@@ -168,13 +168,18 @@ class RageBandit:
         lambda_t,rho_t = self.getOptimalAllocationFW(Z_t, self.initAlloc)
         
         # Compute the total number of samples to take for this round
+        # N_t = int(np.maximum(np.ceil(8*(2**(self.t+1))**2 * rho_t *\
+        #                          (1+self.epsilon) * np.log(self.Z.shape[0]**2 / delta_t)),
+        #                          r_eps))
+            
         N_t = int(np.maximum(np.ceil(8*(2**(self.t+1))**2 * rho_t *\
-                                 (1+self.epsilon) * np.log(self.Z.shape[0]**2 / delta_t)),
+                                 np.log(self.Z.shape[0] / delta_t)),
                                  r_eps))
             
         self.sampleComplexity += N_t
         
         # Round the allocation to get the number of times to pull each arm
+        # TODO: Don't round, just randomly sample the arms
         nPullsPerArm = self.fastRound(lambda_t,N_t)
         arms = np.concatenate([np.tile(i,(nPullsPerArm[i],1)) for i in range(self.n)]).squeeze()
     

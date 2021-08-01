@@ -11,9 +11,11 @@ import torch as t
 from scipy.optimize import linprog
 import matplotlib.pyplot as plt
 
+t.autograd.set_detect_anomaly(False)
+
 class TransductiveBandit:
     
-    def __init__(self,arms,Z,initAlloc,nSteps,nRounds,lambd_reg,theta,delta=.05,eta=1e-5,sigma=1):
+    def __init__(self,arms,Z,initAlloc,nSteps,nRounds,lambd_reg,theta,delta=.05,eta=1e-3,sigma=1,v=2):
         """
         Implementation of a linear transductive bandit algorithm based on iteratively 
         refining a deterministic sampling allocation
@@ -50,7 +52,7 @@ class TransductiveBandit:
         self.nSteps = nSteps
         self.nRounds = nRounds
         
-        self.allocation = np.zeros((self.nRounds+1,self.nSteps+1,self.arms.shape[0]))
+        self.allocation = np.zeros((self.nRounds+1,self.arms.shape[0]))
         self.allocation[0,:] = initAlloc
         
         self.lambd_reg = lambd_reg
@@ -76,15 +78,19 @@ class TransductiveBandit:
         self.k = 1
         # Current step
         self.t = 1
+        
+        # Base for number of samples to take in each round (e.g. self.v**self.k)
+        self.v = v
     
         # Store the number of times each z in \mathcal{Z} has been played here
         self.numTimesOpt = np.zeros((self.Z.shape[0],))
         
         # Store our estimates of theta here
         self.estimates = np.zeros((self.nRounds,self.nSteps,self.d))
+        self.armPlays = np.zeros((self.n,))
         
         # Store z_t here
-        self.z = np.zeros((self.nRounds,self.nSteps,2))
+        self.z = -np.ones((self.nRounds,self.nSteps,2))
         
         self.sampleComplexity = 0
         
@@ -96,11 +102,11 @@ class TransductiveBandit:
         self.zHat = None
         
     def eta(self):
-        return self._eta / self.k**2
+        return self._eta #/ self.k**2
     
     def drawArms(self,allocation):
         
-        sampledArms = np.random.choice(range(self.n),2**(self.k+1),p=allocation)
+        sampledArms = np.random.choice(range(self.n),int(np.ceil(self.v**(self.k+2))),p=allocation)
         return sampledArms
         
     def pull(self,arms):
@@ -162,24 +168,7 @@ class TransductiveBandit:
         
         return thetaHat,Binv
     
-    def getBootstrapEstimates(self,arms,rewards):
-        
-        # Randomly choose the indices of observations we will use
-        bootstrapIdx = np.array([np.random.choice(range(arms.shape[0]), arms.shape[0], replace = True) for _ in range(arms.shape[0])])
-        
-        thetaEstimates = np.zeros((arms.shape[0],self.d))
-        
-        # Get the corresponding arms and rewards
-        for i in range(arms.shape[0]):
-            
-            bootstrapArms = arms[bootstrapIdx[i]]
-            bootstrapRewards = rewards[bootstrapIdx[i]]
-            
-            thetaEstimates[i] = self.estimate(bootstrapArms, bootstrapRewards)
-        
-        return thetaEstimates
-    
-    def updateAllocation(self,allocation,z1,z2,nSteps=1000):
+    def updateAllocation(self,allocation,z1,z2,nSteps=5000):
         
         _arm = t.tensor(self.arms)
         
@@ -187,80 +176,116 @@ class TransductiveBandit:
         z2 = t.tensor(self.arms[z2])
         diff = z1 - z2
         
+        objFnArray = t.zeros((nSteps,))
+        
         allocation = t.tensor(allocation,requires_grad=True)
         
-        for step in range(nSteps):
+        for step in range(1,nSteps+1):
             
             try:
-                A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (_arm[:,None,:] * _arm[:,:,None]),axis=0))
+                A_lambda_inv = t.inverse(t.tensor(self.B_t) + t.sum(int(np.ceil(self.v**(self.k+1))) *\
+                                               allocation[:,None,None] * (_arm[:,None,:] * _arm[:,:,None]),axis=0))
             except Exception as e:
                 print('oops')
                 raise(e)
             
-            objFn = (diff.T @ A_lambda_inv @ diff)
+            # Approximate expectation of objective function using sample mean
+            objFn = t.max(t.sum((diff @ A_lambda_inv) * diff, dim=1))
+            objFnArray[step-1] = objFn
             
             # Use pytorch autograd to compute gradient of this expression w.r.t the allocation
             objFn.backward()
             
-            #TODO : may want to take multiple grad steps per step of alg
             # Take mirror descent step
             grad = allocation.grad
             expAlloc = allocation * t.exp(-self.eta() * grad)
             newAllocation = (expAlloc/t.sum(expAlloc)).clone()
-            
-            # if t.any(t.isnan(newAllocation)) or t.any(newAllocation<0):
-            #     print('oops')
 
+            Delta = t.norm(newAllocation - allocation,p=2)
             allocation = newAllocation.clone().detach().requires_grad_(True)
-
-        return newAllocation.detach().numpy()
+            
+            # if Delta < .01:
+            #     break
+        # print(allocation)
+        return allocation.detach().numpy()
     
-    def getOptimalAllocationFW(self,z1,z2,initAllocation,epochs=1000):
-        '''
-        Use the distribution of \theta_* to compute the optimal sampling allocation using Frank-Wolfe.
-        '''
-        arms = t.tensor(self.arms)
+    def updateAllocationFW(self,allocation,z1,z2,epochs=1000):
         
-        allocation = t.tensor(initAllocation,requires_grad=True)
+        z1 = t.tensor(self.Z[z1])
+        z2 = t.tensor(self.Z[z2])
+        diff = z1 - z2
+        diff = t.unique(diff,dim=0)
         
-        # Define some stuff for minimizing inner product over simplex
+        allocation = t.tensor(allocation,requires_grad=True)
+        
+        X = t.tensor(self.arms)
+        
+         # Define some stuff for minimizing inner product over simplex
         A_ub = -np.eye(self.n)
         b_ub = np.zeros((self.n,1))
         
         A_eq = np.ones((self.n,1)).T
         b_eq = 1
         
+        yHatList = []
         for epoch in range(epochs):
-            
-            # Compute objective function
-            A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (arms[:,None,:] * arms[:,:,None]),axis=0))
 
-            z1 = t.tensor(self.arms[z1])
-            z2 = t.tensor(self.arms[z2])
-            diff = z1 - z2
-            
-            objFn = (diff.T @ A_lambda_inv @ diff)
+            # Compute objective function
+            # A_lambda_inv = t.inverse(t.sum(t.tensor(self.B_t) +\
+            #                                    self.v**(self.k+1) *\
+            #                                    allocation[:,None,None] * (X[:,None,:] * X[:,:,None]),axis=0))
+            try:
+                A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (X[:,None,:] * X[:,:,None]),axis=0))
+            except Exception as e:
+                A_lambda_inv = t.pinverse(t.sum(allocation[:,None,None] * (X[:,None,:] * X[:,:,None]),axis=0))
+            # diff = (X[None,:,:] - X[:,None,:]).reshape(X.shape[0]**2,X.shape[1])
+            # diff = t.unique(diff,dim=0)
+            # objFn = t.max(t.sum((diff @ A_lambda_inv) * diff, dim=1))
+            objFn = t.max(t.sum(diff @ A_lambda_inv  * diff, dim=1))
+            yHat = t.argmax(t.sum(diff @ A_lambda_inv  * diff, dim=1))
+            yHatList.append(yHat)
             
             # Compute gradient
-            objFn.backward()
-            grad = allocation.grad
+            # objFn.backward()
+            # grad = allocation.grad
+            
+            grad = (-diff[yHat] @ A_lambda_inv @ (X[:,None,:] * X[:,:,None]) @ A_lambda_inv @ diff[yHat]).detach()
+            
+            # if t.any(grad.isnan()):
+            #     break
             
             # Update using Frank-Wolfe step
-            aMin = t.tensor(linprog(grad.numpy(),A_ub,b_ub,A_eq,b_eq).x)
+            try:
+                aMin = t.tensor(linprog(grad.numpy(),A_ub,b_ub,A_eq,b_eq).x)
+            except Exception as e:
+                print(e)
             gamma = 2/(epoch+2)
             _allocation = (1-gamma) * allocation + gamma * aMin
 
             Delta = t.norm(_allocation - allocation,p=2)
             allocation = _allocation.clone().detach().requires_grad_(True)
             
-            if Delta < .01:
-                break
+            # if Delta < .01:
+            #     break
 
         with t.no_grad():
 
             toZeroMask = allocation<10**-5
             allocation[toZeroMask] = 0
             allocation = allocation/t.sum(allocation)
+        
+        # print('Finished in {} epochs'.format(epoch))
+        
+        # print(allocation.detach().numpy())
+        # print(np.bincount(self.z[self.k-1,:].reshape((self.nSteps*2)).astype(int),minlength=self.Z.shape[0]))
+        # print('y\'s used to optimize:')
+        # yUnique = np.unique(np.stack(yHatList),axis=0)
+        # print(diff.numpy()[yUnique].astype(np.int))
+        # print('y counts:')
+        # yCounts = np.bincount(np.stack(yHatList),minlength=yUnique.shape[0])
+        # diffnp = diff.numpy().astype(int)
+        # for y in yUnique:
+        #     print('y: {} was max {} times'.format(diffnp[y],yCounts[y]))
         
         return allocation.detach().numpy()
     
@@ -282,81 +307,63 @@ class TransductiveBandit:
 
         """
         
-        # Draw theta1, theta2 from posterior
-        theta = np.random.multivariate_normal(self.posteriorMean[self.k-1], self.posteriorCovar[self.k-1],2)
+        # Draw T pairs theta1, theta2 from posterior
+        theta = np.random.multivariate_normal(self.posteriorMean[self.k-1], self.posteriorCovar[self.k-1], 2*self.nSteps).T
         
         # Pick best z in Z based on draws of theta
-        z1 = np.argmax(np.sum(self.Z * theta[0],axis=1))
-        z2 = np.argmax(np.sum(self.Z * theta[1],axis=1))
+        z1 = np.argmax(self.Z @ theta[:,:self.nSteps],axis=0)
+        z2 = np.argmax(self.Z @ theta[:,self.nSteps:],axis=0)
         
-        self.numTimesOpt[z1] += 1
-        self.numTimesOpt[z2] += 1
+        self.numTimesOpt += np.bincount(z1, minlength=self.Z.shape[0])
+        self.numTimesOpt += np.bincount(z2, minlength=self.Z.shape[0])
 
-        newAllocation = self.updateAllocation(self.allocation[self.k-1,self.t-1],z1,z2)
-        self.allocation[self.k-1,self.t] = newAllocation
+        self.z[self.k-1,:,0] = z1
+        self.z[self.k-1,:,1] = z2
 
-        self.z[self.k-1,self.t-1,0] = z1
-        self.z[self.k-1,self.t-1,1] = z2
+        newAllocation = self.updateAllocationFW(self.allocation[self.k-1],z1,z2)
+        self.allocation[self.k-1] = newAllocation
+            
+        # Draw arms from current allocation and pull
+        arms = self.drawArms(self.allocation[self.k-1])
+        rewards = self.pull(arms)
         
-        # Increment the step
-        self.t += 1
-             
-        # Increment the round if we have taken enough steps
-        if self.t > self.nSteps:
+        # Track history 
+        # self.armsHistory.append(_arms)
+        # self.rewardsHistory.append(rewards)
+        
+        # Update B matrix
+        self.updateB_t(arms)
+        
+        # Update rewards times arms
+        self.rewTimesArms += np.sum(self.arms[arms] * rewards[:,None],axis=0)
+        
+        # Update sample complexity
+        self.sampleComplexity += arms.shape[0]
+        
+        # Compute posterior params
+        mu,sigma = self.getPosterior()
+        
+        # posteriorCovar = np.linalg.pinv(np.linalg.pinv(self.posteriorCovar[self.k-1])+n*np.linalg.pinv(sigma))
+        # posteriorMean = posteriorCovar @\
+        #     (np.linalg.pinv(self.posteriorCovar[self.k-1])@self.posteriorMean[self.k-1] + n*np.linalg.pinv(sigma)@thetaBar)
             
-            # Draw arms from current allocation and pull
-            arms = self.drawArms(self.allocation[self.k-1,self.t-1])
-            rewards = self.pull(arms)
-            
-            # Track history
-            # self.armsHistory.append(_arms)
-            # self.rewardsHistory.append(rewards)
-            
-            # Update B matrix
-            self.updateB_t(arms)
-            
-            # Update rewards times arms
-            self.rewTimesArms += np.sum(self.arms[arms] * rewards[:,None],axis=0)
-            
-            # Update sample complexity
-            self.sampleComplexity += arms.shape[0]
-            
-            # Compute posterior params
-            mu,sigma = self.getPosterior()
-            
-            # posteriorCovar = np.linalg.pinv(np.linalg.pinv(self.posteriorCovar[self.k-1])+n*np.linalg.pinv(sigma))
-            # posteriorMean = posteriorCovar @\
-            #     (np.linalg.pinv(self.posteriorCovar[self.k-1])@self.posteriorMean[self.k-1] + n*np.linalg.pinv(sigma)@thetaBar)
-                
-            self.posteriorCovar[self.k] = sigma
-            self.posteriorMean[self.k] = mu
-            
-            self.allocation[self.k,0] = newAllocation
-            
-            # Check if termination condition is met
-            terminateNow,zHat = self.checkTerminationCond()
-            
-            print('Done with round {}'.format(self.k))
-            
-            self.k += 1
-            self.t = 1
-            
-            # empiricalProbOpt = self.numTimesOpt/np.sum(self.numTimesOpt)
-            # # print(empiricalProbOpt)
-            # if np.max(empiricalProbOpt) >= 1-self.delta:
-            #     self.optZ = np.argmax(empiricalProbOpt)
-                
-            self.numTimesOpt = np.zeros((self.Z.shape[0],))
-            
-            if terminateNow:
-                return zHat
-            else:
-                return None
+        self.posteriorCovar[self.k] = sigma
+        self.posteriorMean[self.k] = mu
+        
+        self.allocation[self.k] = newAllocation
+        
+        print('Done with round {}'.format(self.k))
+        
+        # empiricalProbOpt = self.numTimesOpt/np.sum(self.numTimesOpt)
+        # # print(empiricalProbOpt)
+        # if np.max(empiricalProbOpt) >= 1-self.delta:
+        #     self.optZ = np.argmax(empiricalProbOpt)
         
     def updateB_t(self,arms):
         
         playsPerArm = np.bincount(arms,minlength=self.n)
         
+        self.armPlays += playsPerArm
         self.B_t += np.sum(playsPerArm[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0)
         
     def checkTerminationCond(self):
@@ -365,11 +372,10 @@ class TransductiveBandit:
         diff = self.Z[zHat][None,:] - self.Z
         diff = diff[np.sum(np.abs(diff),axis=1)>0]
         
-        allocation = self.allocation[self.k,0]
-        A_lambda_inv = np.linalg.inv(self.sampleComplexity * np.sum(allocation[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
-        # A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
+        # allocation = self.allocation[self.k]
+        # A_lambda_inv = np.linalg.pinv(self.sampleComplexity * np.sum(allocation[:,None,None] * (self.arms[:,None,:] * self.arms[:,:,None]),axis=0))
+        A_lambda_inv = np.linalg.pinv(self.B_t)
         
-        # A_inv = np.linalg.pinv(self.B_t)
         A_inv_norm = np.sum((diff @ A_lambda_inv[None,:,:]).squeeze() * diff,axis=1)
         
         rhs = np.sqrt(2*A_inv_norm*np.log(2*self.Z.shape[0]*self.k**2/self.delta))
@@ -391,55 +397,26 @@ class TransductiveBandit:
 
         """
         
-        while True:
+        terminateNow = False
+        
+        while not terminateNow:
             
             zHat = self.playStep()
             
-            if zHat is not None:
-                self.zHat = zHat
-                break      
-
-def getOptimalAllocation(X,Z,theta,initAllocation,eta=1e-3,epochs=5000):
-    '''
-    Use the distribution of \theta_* to compute the optimal sampling allocation using mirror descent.
-    '''
-    arms = t.tensor(X)
-    Z = t.tensor(Z)
-    zStar_i = t.argmax(t.sum(Z*theta,dim=-1))
-    _Z = arms[t.tensor([z for z in range(Z.shape[0]) if z!=zStar_i])]
-    zStar = arms[t.argmax(t.sum(Z*theta,dim=-1))]
-    
-    allocation = t.tensor(initAllocation,requires_grad=True)
-    
-    print('Solving for optimal sampling allocation...')
-    for epoch in range(epochs):
-        
-        # Compute objective function
-        A_lambda_inv = t.inverse(t.sum(allocation[:,None,None] * (arms[:,None,:] * arms[:,:,None]),axis=0))
-        diff = zStar - _Z
-        objFn = t.max((diff @ A_lambda_inv @ diff.T)[0]/(diff @ theta)**2)
-        
-        # Compute gradient
-        objFn.backward()
-        grad = allocation.grad
-        
-        # Update using closed-form mirror descent update for KL divergence
-        expAlloc = allocation * t.exp(-eta * grad)
-        allocation = (expAlloc/t.sum(expAlloc)).clone().detach().requires_grad_(True)
-        
-        if epoch%1000==0:
-            print('Done with epoch {}!'.format(epoch))
-        
-    return allocation.detach().numpy()
+            # Check if termination condition is met
+            terminateNow,zHat = self.checkTerminationCond()  
+            self.zHat = zHat
+            
+            self.k += 1
 
 def runBenchmark():
 
     np.random.seed(123456)
     
     nReps = 20
-    dVals = (5,10,15,20,25,30)
+    # dVals = (5,10,15,20,25,30)
     # dVals = (5,10,15,20,25,30,35)
-    # dVals = (35,)
+    dVals = (5,)
     
     sampleComplexity = []
     incorrectCount = np.zeros((len(dVals,)))
@@ -454,8 +431,8 @@ def runBenchmark():
         n = X.shape[0]
         theta = 2*Z[0]
         
-        T = 1000
-        K = 50
+        T = 2500
+        K = 1000
         
         # Index of the optimal choice in Z
         initAlloc = np.ones((n,))/n
@@ -465,7 +442,7 @@ def runBenchmark():
             
             print('Replication {} of {}'.format(rep,nReps))
             
-            bandit = TransductiveBandit(X,X,initAlloc,T,K,lambd_reg=0,theta=theta)
+            bandit = TransductiveBandit(X,X,initAlloc,T,K,lambd_reg=0,theta=theta,v=2)
             bandit.play() 
             results.append(bandit.sampleComplexity)
             
@@ -477,7 +454,7 @@ def runBenchmark():
                 print('Best arm: {}'.format(X[0]))
                 incorrectCount[i] += 1
             
-        sampleComplexity.append(sum(results)/nReps)
+        sampleComplexity.append(sum(results)/len(results))
         
     fig,ax = plt.subplots(1)
     ax.plot(dVals,sampleComplexity)
